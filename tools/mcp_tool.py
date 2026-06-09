@@ -93,6 +93,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
+from gateway.metrics import emit_metric, exception_summary
+
 logger = logging.getLogger(__name__)
 
 
@@ -1174,8 +1176,14 @@ class MCPServerTask:
             await self._refresh_tools()
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception("MCP server '%s': dynamic tool refresh failed", self.name)
+            emit_metric(
+                "mcp-refresh-failure",
+                server=self.name,
+                transport="http" if self._is_http() else "stdio",
+                exception=exception_summary(exc),
+            )
 
     def _schedule_tools_refresh(self) -> asyncio.Task:
         """Schedule a background tool refresh and keep it strongly referenced."""
@@ -1886,6 +1894,14 @@ class MCPServerTask:
                             "%d attempts, giving up: %s",
                             self.name, _MAX_INITIAL_CONNECT_RETRIES, exc,
                         )
+                        emit_metric(
+                            "mcp-give-up",
+                            server=self.name,
+                            phase="initial_connect",
+                            attempts=_MAX_INITIAL_CONNECT_RETRIES,
+                            transport="http" if self._is_http() else "stdio",
+                            exception=exception_summary(exc),
+                        )
                         self._error = exc
                         self._ready.set()
                         return
@@ -1895,6 +1911,16 @@ class MCPServerTask:
                         "(attempt %d/%d), retrying in %.0fs: %s",
                         self.name, initial_retries,
                         _MAX_INITIAL_CONNECT_RETRIES, backoff, exc,
+                    )
+                    emit_metric(
+                        "mcp-reconnect",
+                        server=self.name,
+                        phase="initial_connect",
+                        attempt=initial_retries,
+                        max_attempts=_MAX_INITIAL_CONNECT_RETRIES,
+                        backoff_s=backoff,
+                        transport="http" if self._is_http() else "stdio",
+                        exception=exception_summary(exc),
                     )
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
@@ -1921,6 +1947,14 @@ class MCPServerTask:
                         "giving up: %s",
                         self.name, _MAX_RECONNECT_RETRIES, exc,
                     )
+                    emit_metric(
+                        "mcp-give-up",
+                        server=self.name,
+                        phase="reconnect",
+                        attempts=_MAX_RECONNECT_RETRIES,
+                        transport="http" if self._is_http() else "stdio",
+                        exception=exception_summary(exc),
+                    )
                     return
 
                 logger.warning(
@@ -1928,6 +1962,16 @@ class MCPServerTask:
                     "reconnecting in %.0fs: %s",
                     self.name, retries, _MAX_RECONNECT_RETRIES,
                     backoff, exc,
+                )
+                emit_metric(
+                    "mcp-reconnect",
+                    server=self.name,
+                    phase="reconnect",
+                    attempt=retries,
+                    max_attempts=_MAX_RECONNECT_RETRIES,
+                    backoff_s=backoff,
+                    transport="http" if self._is_http() else "stdio",
+                    exception=exception_summary(exc),
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)

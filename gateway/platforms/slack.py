@@ -50,6 +50,7 @@ from gateway.platforms.base import (
     safe_url_for_log,
     cache_document_from_bytes,
 )
+from gateway.metrics import emit_metric, exception_summary
 
 
 logger = logging.getLogger(__name__)
@@ -1055,6 +1056,44 @@ class SlackAdapter(BasePlatformAdapter):
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
 
+    @staticmethod
+    def _slack_error_code(exc: BaseException) -> str:
+        """Best-effort extraction of Slack Web API error codes."""
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                code = response.get("error")
+                if code:
+                    return str(code)
+            except Exception:
+                pass
+        text = str(exc)
+        match = re.search(r"\b(msg_too_long|not_in_channel|channel_not_found|missing_scope|invalid_auth)\b", text)
+        return match.group(1) if match else type(exc).__name__
+
+    def _emit_slack_delivery_metric(
+        self,
+        event: str,
+        *,
+        operation: str,
+        chat_id: str,
+        error: Optional[BaseException | str] = None,
+        **fields: Any,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "platform": "slack",
+            "operation": operation,
+            "chat": chat_id,
+        }
+        payload.update(fields)
+        if error is not None:
+            if isinstance(error, BaseException):
+                payload["error"] = self._slack_error_code(error)
+                payload["exception"] = exception_summary(error)
+            else:
+                payload["error"] = str(error)[:300]
+        emit_metric(event, **payload)
+
     async def send(
         self,
         chat_id: str,
@@ -1084,6 +1123,14 @@ class SlackAdapter(BasePlatformAdapter):
 
             # Split long messages, preserving code block boundaries
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            if len(chunks) > 1:
+                self._emit_slack_delivery_metric(
+                    "slack-chunked",
+                    operation="chat.postMessage",
+                    chat_id=chat_id,
+                    chunks=len(chunks),
+                    chars=len(formatted),
+                )
 
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             last_result = None
@@ -1131,6 +1178,12 @@ class SlackAdapter(BasePlatformAdapter):
 
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[Slack] Send error: %s", e, exc_info=True)
+            self._emit_slack_delivery_metric(
+                "send-failure",
+                operation="chat.postMessage",
+                chat_id=chat_id,
+                error=e,
+            )
             return SendResult(success=False, error=str(e))
 
     async def send_private_notice(
@@ -1182,11 +1235,28 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         try:
             formatted = self.format_message(content)
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            if len(chunks) > 1:
+                self._emit_slack_delivery_metric(
+                    "slack-edit-chunked",
+                    operation="chat.update",
+                    chat_id=chat_id,
+                    chunks=len(chunks),
+                    chars=len(formatted),
+                )
+
             await self._get_client(chat_id).chat_update(
                 channel=chat_id,
                 ts=message_id,
-                text=formatted,
+                text=chunks[0] if chunks else "",
             )
+            for chunk in chunks[1:]:
+                await self._get_client(chat_id).chat_postMessage(
+                    channel=chat_id,
+                    thread_ts=message_id,
+                    text=chunk,
+                    mrkdwn=True,
+                )
             if finalize:
                 await self.stop_typing(chat_id)
             return SendResult(success=True, message_id=message_id)
@@ -1197,6 +1267,13 @@ class SlackAdapter(BasePlatformAdapter):
                 chat_id,
                 e,
                 exc_info=True,
+            )
+            self._emit_slack_delivery_metric(
+                "send-failure",
+                operation="chat.update",
+                chat_id=chat_id,
+                message_id=message_id,
+                error=e,
             )
             return SendResult(success=False, error=str(e))
 

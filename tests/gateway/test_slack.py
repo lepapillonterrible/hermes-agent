@@ -3736,3 +3736,62 @@ class TestSlashEphemeralAck:
         # the normal single-user case; the ContextVar path is the precise one.
         # The key invariant is: when the ContextVar IS set, it matches exactly.
         assert ctx is not None  # fallback path finds the entry
+
+
+# ---------------------------------------------------------------------------
+# Structured metrics / delivery observability
+# ---------------------------------------------------------------------------
+
+def _metric_payloads(caplog, event: str):
+    import json
+
+    payloads = []
+    for record in caplog.records:
+        msg = record.getMessage()
+        marker = "gateway_metric "
+        if marker in msg:
+            payload = json.loads(msg.split(marker, 1)[1])
+            if payload.get("event") == event:
+                payloads.append(payload)
+    return payloads
+
+
+@pytest.mark.asyncio
+async def test_edit_message_chunks_long_updates_and_emits_metric(adapter, caplog):
+    caplog.set_level("INFO", logger="gateway.metrics")
+    adapter.MAX_MESSAGE_LENGTH = 40
+    adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
+    adapter._app.client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "456.0"})
+
+    result = await adapter.edit_message("C123", "123.0", "x" * 95, finalize=True)
+
+    assert result.success is True
+    adapter._app.client.chat_update.assert_awaited_once()
+    update_kwargs = adapter._app.client.chat_update.await_args.kwargs
+    assert update_kwargs["ts"] == "123.0"
+    assert len(update_kwargs["text"]) <= adapter.MAX_MESSAGE_LENGTH
+    assert adapter._app.client.chat_postMessage.await_count >= 1
+    for call_ in adapter._app.client.chat_postMessage.await_args_list:
+        assert call_.kwargs["thread_ts"] == "123.0"
+        assert len(call_.kwargs["text"]) <= adapter.MAX_MESSAGE_LENGTH
+
+    payloads = _metric_payloads(caplog, "slack-edit-chunked")
+    assert payloads
+    assert payloads[-1]["operation"] == "chat.update"
+    assert payloads[-1]["platform"] == "slack"
+    assert payloads[-1]["chunks"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_slack_send_failure_metric_includes_web_api_error(adapter, caplog):
+    caplog.set_level("INFO", logger="gateway.metrics")
+    adapter._app.client.chat_postMessage = AsyncMock(side_effect=RuntimeError("not_in_channel"))
+
+    result = await adapter.send("C123", "hello")
+
+    assert result.success is False
+    payloads = _metric_payloads(caplog, "send-failure")
+    assert payloads
+    assert payloads[-1]["platform"] == "slack"
+    assert payloads[-1]["operation"] == "chat.postMessage"
+    assert payloads[-1]["error"] == "not_in_channel"

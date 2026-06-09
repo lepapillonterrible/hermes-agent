@@ -55,6 +55,7 @@ from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from gateway.metrics import emit_metric, exception_summary
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -4324,7 +4325,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
         if self._restart_task_started:
+            emit_metric(
+                "restart",
+                phase="request_ignored",
+                detached=detached,
+                via_service=via_service,
+                reason="already_started",
+            )
             return False
+        emit_metric(
+            "restart",
+            phase="requested",
+            detached=detached,
+            via_service=via_service,
+        )
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
@@ -5579,6 +5593,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Stop the gateway and disconnect all adapters."""
         if restart:
+            emit_metric(
+                "restart",
+                phase="stopping",
+                detached=detached_restart,
+                via_service=service_restart,
+            )
             self._restart_requested = True
             self._restart_detached = detached_restart
             self._restart_via_service = service_restart
@@ -6189,6 +6209,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
+        emit_metric(
+            "inbound",
+            platform=source.platform.value if getattr(source, "platform", None) else "unknown",
+            chat=source.chat_id or "unknown",
+            user=source.user_id or "unknown",
+            chat_type=getattr(source, "chat_type", None),
+            message_type=getattr(getattr(event, "message_type", None), "value", str(getattr(event, "message_type", ""))),
+            text_chars=len(getattr(event, "text", "") or ""),
+            media_count=len(getattr(event, "media_urls", None) or []),
+            internal=is_internal,
+        )
 
         # Fire pre_gateway_dispatch plugin hook for user-originated messages.
         # Plugins receive the MessageEvent and may return a dict influencing flow:
@@ -8378,6 +8409,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _platform_name, source.chat_id or "unknown",
                 _response_time, _api_calls, _resp_len,
             )
+            emit_metric(
+                "response-ready",
+                platform=_platform_name,
+                chat=source.chat_id or "unknown",
+                latency_s=round(_response_time, 3),
+                api_calls=_api_calls,
+                response_chars=_resp_len,
+                already_sent=bool(agent_result.get("already_sent")),
+                failed=bool(agent_result.get("failed")),
+            )
+            if agent_result.get("failed"):
+                emit_metric(
+                    "provider-failure",
+                    platform=_platform_name,
+                    chat=source.chat_id or "unknown",
+                    session=session_key,
+                    error=_redact_gateway_user_facing_secrets(
+                        str(agent_result.get("error") or response or "")[:500]
+                    ),
+                    status="agent_result_failed",
+                )
 
             # Successful turn — clear any stuck-loop counter for this session.
             # This ensures the counter only accumulates across CONSECUTIVE
@@ -8724,6 +8776,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             logger.exception("Agent error in session %s", session_key)
+            try:
+                emit_metric(
+                    "provider-failure",
+                    platform=source.platform.value if getattr(source, "platform", None) else None,
+                    chat=source.chat_id or "unknown",
+                    session=session_key,
+                    exception=exception_summary(e),
+                )
+            except Exception:
+                logger.debug("provider-failure metric emission failed", exc_info=True)
             # Crash-resilience for failures that happen before AIAgent enters
             # run_conversation() (for example: provider/httpx client init
             # failures). In that path the agent cannot persist the current

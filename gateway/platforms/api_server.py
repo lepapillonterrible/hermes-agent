@@ -58,6 +58,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from gateway.metrics import emit_metric
 
 logger = logging.getLogger(__name__)
 
@@ -905,9 +906,19 @@ class APIServerAdapter(BasePlatformAdapter):
             if hmac.compare_digest(token, self._api_key):
                 return None  # Auth OK
 
+        audit_ctx = self._request_audit_context(request)
+        auth_state = "missing" if not auth_header else (
+            "bearer_invalid" if auth_header.startswith("Bearer ") else "unsupported"
+        )
         logger.warning(
             "API server rejected invalid API key: %s",
             self._request_audit_log_suffix(request),
+        )
+        emit_metric(
+            "api-invalid-key",
+            platform="api_server",
+            auth_state=auth_state,
+            **audit_ctx,
         )
         return web.json_response(
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
